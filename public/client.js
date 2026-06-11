@@ -1,6 +1,12 @@
 const socket = io();
 
-// DOM Elements
+// ===== State =====
+let devices = {}; // deviceId -> { metrics, online, hostname, isLocal, lastUpdate }
+let currentDeviceId = null;
+let localDeviceId = null;
+let latestCpuCores = [];
+
+// ===== DOM Elements =====
 const cpuValue = document.getElementById('cpu-value');
 const cpuNameLine = document.getElementById('cpu-name-line');
 const ramValue = document.getElementById('ram-value');
@@ -36,9 +42,10 @@ const vncCheckBtn = document.getElementById('vnc-check-btn');
 const vncStartBtn = document.getElementById('vnc-start-btn');
 const vncWebBtn = document.getElementById('vnc-web-btn');
 const vncLogPreview = document.getElementById('vnc-log-preview');
+const deviceSelect = document.getElementById('device-select');
+const deviceStatusDot = document.getElementById('device-status-dot');
 
-let latestCpuCores = [];
-
+// ===== Utils =====
 function formatRate(bytesPerSec) {
     if (!Number.isFinite(bytesPerSec) || bytesPerSec <= 0) return '0 KB/s';
     if (bytesPerSec >= 1024 * 1024) return `${(bytesPerSec / 1024 / 1024).toFixed(2)} MB/s`;
@@ -92,7 +99,6 @@ async function openWebRemoteDesktop() {
             return;
         }
 
-        // Keep password only in this tab/session for noVNC auth.
         sessionStorage.setItem(`vnc_pwd_${data.token}`, password);
         window.location.href = data.remotePath || `/remote.html?token=${encodeURIComponent(data.token)}`;
     } catch (error) {
@@ -135,7 +141,129 @@ async function runVncAction(endpoint, button) {
     }
 }
 
-// Fan Control Logic
+// ===== Device Switching =====
+function updateDeviceSelector() {
+    const prevVal = deviceSelect.value;
+    deviceSelect.innerHTML = '';
+    const ids = Object.keys(devices).sort((a, b) => {
+        if (devices[a].isLocal && !devices[b].isLocal) return -1;
+        if (!devices[a].isLocal && devices[b].isLocal) return 1;
+        return 0;
+    });
+    ids.forEach((id) => {
+        const info = devices[id];
+        const opt = document.createElement('option');
+        opt.value = id;
+        opt.textContent = `${info.hostname || id}${info.isLocal ? ' (本机)' : ''}`;
+        deviceSelect.appendChild(opt);
+    });
+    if (prevVal && devices[prevVal]) {
+        deviceSelect.value = prevVal;
+    } else if (localDeviceId) {
+        deviceSelect.value = localDeviceId;
+        currentDeviceId = localDeviceId;
+    } else if (ids.length > 0) {
+        deviceSelect.value = ids[0];
+        currentDeviceId = ids[0];
+    }
+}
+
+function updateDeviceStatusDot(online) {
+    if (!deviceStatusDot) return;
+    deviceStatusDot.className = online ? 'status-dot online' : 'status-dot offline';
+    deviceStatusDot.title = online ? '在线' : '离线';
+}
+
+function updateLocalControlsVisibility() {
+    const isLocal = currentDeviceId === localDeviceId;
+    const display = isLocal ? '' : 'none';
+    if (reportBtn) reportBtn.style.display = display;
+    const fanControl = fanToggle ? fanToggle.closest('.fan-control') : null;
+    if (fanControl) fanControl.style.display = display;
+    if (vncCheckBtn) vncCheckBtn.style.display = display;
+    if (vncStartBtn) vncStartBtn.style.display = display;
+    if (vncWebBtn) vncWebBtn.style.display = display;
+
+    // Remote VNC placeholder
+    if (!isLocal) {
+        vncStateValue.textContent = '远程设备';
+        vncStateValue.classList.remove('vnc-state-up', 'vnc-state-down');
+        vncLastCheck.textContent = 'VNC 仅在本机可用';
+        vncLogPreview.textContent = '--';
+    }
+}
+
+// ===== UI Update =====
+function updateUI(data) {
+    cpuValue.textContent = `${data.cpu_load.toFixed(1)}%`;
+    ramValue.textContent = `${((data.mem_used / data.mem_total) * 100).toFixed(1)}%`;
+    gpuValue.textContent = `${data.gpu_load.toFixed(1)}%`;
+
+    const diskPercent = (data.fs_used / data.fs_size) * 100;
+    diskUsageValue.textContent = `${diskPercent.toFixed(1)}%`;
+    diskProgress.style.width = `${diskPercent}%`;
+    diskDetail.textContent = `${(data.fs_used / 1073741824).toFixed(1)} GB / ${(data.fs_size / 1073741824).toFixed(1)} GB`;
+
+    const diskReadMb = (data.disk_read_sec / 1024 / 1024);
+    const diskWriteMb = (data.disk_write_sec / 1024 / 1024);
+    const diskIOMb = diskReadMb + diskWriteMb;
+    diskRead.textContent = `${diskReadMb.toFixed(2)} MB/s`;
+    diskWrite.textContent = `${diskWriteMb.toFixed(2)} MB/s`;
+    diskIoTotal.textContent = `${diskIOMb.toFixed(2)} MB/s`;
+
+    tempValue.textContent = Number.isFinite(data.temp_main) ? Number(data.temp_main).toFixed(1) : '--';
+    gpuTempValue.textContent = Number.isFinite(data.temp_gpu) ? Number(data.temp_gpu).toFixed(1) : '--';
+    tempCpuValue.textContent = Number.isFinite(data.temp_main) ? Number(data.temp_main).toFixed(1) : '--';
+    tempGpuValue.textContent = Number.isFinite(data.temp_gpu) ? Number(data.temp_gpu).toFixed(1) : '--';
+    gpuName.textContent = data.gpu_name || '';
+    cpuNameLine.textContent = data.cpu_name || '--';
+    latestCpuCores = Array.isArray(data.cpu_cores) ? data.cpu_cores : [];
+
+    const maxTemp = Math.max(data.temp_main || 0, data.temp_gpu || 0);
+    if (maxTemp >= 85) {
+        tempState.textContent = '过热';
+        tempState.style.color = '#f44336';
+    } else if (maxTemp >= 70) {
+        tempState.textContent = '偏高';
+        tempState.style.color = '#ff9800';
+    } else {
+        tempState.textContent = '正常';
+        tempState.style.color = '#4caf50';
+    }
+
+    ramDetail.textContent = `${(data.mem_used / 1073741824).toFixed(1)} GB / ${(data.mem_total / 1073741824).toFixed(1)} GB`;
+    const gpuMemPercent = data.gpu_mem_total > 0 ? ((data.gpu_mem_used / data.gpu_mem_total) * 100) : 0;
+    gpuMemValue.textContent = `${gpuMemPercent.toFixed(1)}%`;
+
+    const rx = data.net_rx_sec || 0;
+    const tx = data.net_tx_sec || 0;
+    netIn.textContent = formatRate(rx);
+    netOut.textContent = formatRate(tx);
+    netTotal.textContent = formatRate(rx + tx);
+
+    updateMiniChart(cpuChart, data.cpu_load);
+    updateMiniChart(ramChart, (data.mem_used / data.mem_total) * 100);
+    updateMiniChart(gpuChart, data.gpu_load);
+    updateMiniChart(netChart, Math.min(100, ((rx + tx) / (10 * 1024 * 1024)) * 100));
+    updateMiniChart(tempChart, Math.min(100, maxTemp));
+    updateMiniChart(diskChart, diskPercent);
+    updateMiniChart(diskIoChart, Math.min(100, (diskIOMb / 200) * 100));
+
+    if (data.vnc) {
+        updateVncUI(data.vnc);
+    }
+}
+
+function updateUIFromCache() {
+    const dev = devices[currentDeviceId];
+    if (dev && dev.metrics) {
+        updateUI(dev.metrics);
+    }
+    updateLocalControlsVisibility();
+    updateDeviceStatusDot(dev ? dev.online : false);
+}
+
+// ===== Event Listeners =====
 fanToggle.addEventListener('change', async (e) => {
     const isStrong = e.target.checked;
     try {
@@ -154,7 +282,7 @@ fanToggle.addEventListener('change', async (e) => {
     } catch (err) {
         console.error('Fan control error:', err);
         alert('设置风扇模式失败: ' + err.message);
-        e.target.checked = !isStrong; // Revert
+        e.target.checked = !isStrong;
     }
 });
 
@@ -163,11 +291,7 @@ reportBtn.addEventListener('click', async () => {
     reportBtn.textContent = '发送中...';
     try {
         const res = await fetch('/api/report', { method: 'POST' });
-        
-        if (!res.ok) {
-            throw new Error(`HTTP error! status: ${res.status}`);
-        }
-        
+        if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
         const data = await res.json();
         if (data.success) {
             alert('报告已发送到您的邮箱');
@@ -175,7 +299,7 @@ reportBtn.addEventListener('click', async () => {
             alert('发送失败: ' + (data.error || 'Unknown error'));
         }
     } catch (e) {
-        console.error("Report fetch error:", e);
+        console.error('Report fetch error:', e);
         alert('发送请求失败，请检查网络或服务器日志。\n' + e.message);
     } finally {
         reportBtn.disabled = false;
@@ -183,7 +307,35 @@ reportBtn.addEventListener('click', async () => {
     }
 });
 
-// Charts Configuration
+if (deviceSelect) {
+    deviceSelect.addEventListener('change', (e) => {
+        currentDeviceId = e.target.value;
+        updateUIFromCache();
+        const activeBtn = document.querySelector('.time-btn.active');
+        loadHistory(activeBtn ? activeBtn.dataset.range : '1d');
+    });
+}
+
+cpuCard.addEventListener('click', () => {
+    renderCpuCores();
+    cpuModal.classList.remove('hidden');
+});
+
+cpuModalClose.addEventListener('click', () => {
+    cpuModal.classList.add('hidden');
+});
+
+cpuModal.addEventListener('click', (event) => {
+    if (event.target === cpuModal) {
+        cpuModal.classList.add('hidden');
+    }
+});
+
+vncCheckBtn.addEventListener('click', () => runVncAction('/api/vnc/check', vncCheckBtn));
+vncStartBtn.addEventListener('click', () => runVncAction('/api/vnc/start', vncStartBtn));
+vncWebBtn.addEventListener('click', openWebRemoteDesktop);
+
+// ===== Charts =====
 const chartConfig = {
     type: 'line',
     options: {
@@ -231,92 +383,12 @@ const tempChart = createMiniChart(document.getElementById('tempChart').getContex
 const diskChart = createMiniChart(document.getElementById('diskChart').getContext('2d'), '#03a9f4');
 const diskIoChart = createMiniChart(document.getElementById('diskIoChart').getContext('2d'), '#ffc107');
 
-// Real-time Update Logic
 function updateMiniChart(chart, value) {
     const data = chart.data.datasets[0].data;
     data.shift();
     data.push(value);
     chart.update();
 }
-
-socket.on('connect', () => {
-    statusBadge.textContent = '已连接';
-    statusBadge.className = 'status-badge connected';
-});
-
-socket.on('disconnect', () => {
-    statusBadge.textContent = '断开连接';
-    statusBadge.className = 'status-badge disconnected';
-});
-
-socket.on('metrics', (data) => {
-    // Update Values
-    cpuValue.textContent = `${data.cpu_load.toFixed(1)}%`;
-    ramValue.textContent = `${((data.mem_used / data.mem_total) * 100).toFixed(1)}%`;
-    gpuValue.textContent = `${data.gpu_load.toFixed(1)}%`;
-    
-    // Disk
-    const diskPercent = (data.fs_used / data.fs_size) * 100;
-    diskUsageValue.textContent = `${diskPercent.toFixed(1)}%`;
-    diskProgress.style.width = `${diskPercent}%`;
-    diskDetail.textContent = `${(data.fs_used / 1073741824).toFixed(1)} GB / ${(data.fs_size / 1073741824).toFixed(1)} GB`;
-    
-    // I/O
-    const diskReadMb = (data.disk_read_sec / 1024 / 1024);
-    const diskWriteMb = (data.disk_write_sec / 1024 / 1024);
-    const diskIOMb = diskReadMb + diskWriteMb;
-    diskRead.textContent = `${diskReadMb.toFixed(2)} MB/s`;
-    diskWrite.textContent = `${diskWriteMb.toFixed(2)} MB/s`;
-    diskIoTotal.textContent = `${diskIOMb.toFixed(2)} MB/s`;
-
-    // Misc
-    tempValue.textContent = Number.isFinite(data.temp_main) ? Number(data.temp_main).toFixed(1) : '--';
-    gpuTempValue.textContent = Number.isFinite(data.temp_gpu) ? Number(data.temp_gpu).toFixed(1) : '--';
-    tempCpuValue.textContent = Number.isFinite(data.temp_main) ? Number(data.temp_main).toFixed(1) : '--';
-    tempGpuValue.textContent = Number.isFinite(data.temp_gpu) ? Number(data.temp_gpu).toFixed(1) : '--';
-    gpuName.textContent = data.gpu_name || '';
-    cpuNameLine.textContent = data.cpu_name || '--';
-    latestCpuCores = Array.isArray(data.cpu_cores) ? data.cpu_cores : [];
-
-    const maxTemp = Math.max(data.temp_main || 0, data.temp_gpu || 0);
-    if (maxTemp >= 85) {
-        tempState.textContent = '过热';
-        tempState.style.color = '#f44336';
-    } else if (maxTemp >= 70) {
-        tempState.textContent = '偏高';
-        tempState.style.color = '#ff9800';
-    } else {
-        tempState.textContent = '正常';
-        tempState.style.color = '#4caf50';
-    }
-
-    ramDetail.textContent = `${(data.mem_used / 1073741824).toFixed(1)} GB / ${(data.mem_total / 1073741824).toFixed(1)} GB`;
-    const gpuMemPercent = data.gpu_mem_total > 0 ? ((data.gpu_mem_used / data.gpu_mem_total) * 100) : 0;
-    gpuMemValue.textContent = `${gpuMemPercent.toFixed(1)}%`;
-
-    const rx = data.net_rx_sec || 0;
-    const tx = data.net_tx_sec || 0;
-    netIn.textContent = formatRate(rx);
-    netOut.textContent = formatRate(tx);
-    netTotal.textContent = formatRate(rx + tx);
-
-    // Update Charts
-    updateMiniChart(cpuChart, data.cpu_load);
-    updateMiniChart(ramChart, (data.mem_used / data.mem_total) * 100);
-    updateMiniChart(gpuChart, data.gpu_load);
-    updateMiniChart(netChart, Math.min(100, ((rx + tx) / (10 * 1024 * 1024)) * 100));
-    updateMiniChart(tempChart, Math.min(100, maxTemp));
-    updateMiniChart(diskChart, diskPercent);
-    updateMiniChart(diskIoChart, Math.min(100, (diskIOMb / 200) * 100));
-
-    if (data.vnc) {
-        updateVncUI(data.vnc);
-    }
-});
-
-socket.on('vnc-status', (data) => {
-    updateVncUI(data);
-});
 
 function renderCpuCores() {
     if (!latestCpuCores.length) {
@@ -328,22 +400,48 @@ function renderCpuCores() {
         .join('');
 }
 
-cpuCard.addEventListener('click', () => {
-    renderCpuCores();
-    cpuModal.classList.remove('hidden');
+// ===== Socket.io =====
+socket.on('connect', () => {
+    statusBadge.textContent = '已连接';
+    statusBadge.className = 'status-badge connected';
 });
 
-cpuModalClose.addEventListener('click', () => {
-    cpuModal.classList.add('hidden');
+socket.on('disconnect', () => {
+    statusBadge.textContent = '断开连接';
+    statusBadge.className = 'status-badge disconnected';
 });
 
-cpuModal.addEventListener('click', (event) => {
-    if (event.target === cpuModal) {
-        cpuModal.classList.add('hidden');
+socket.on('metrics', (data) => {
+    const { deviceId, ...metrics } = data;
+    if (!devices[deviceId]) devices[deviceId] = {};
+    devices[deviceId].metrics = metrics;
+    devices[deviceId].lastUpdate = Date.now();
+    if (deviceId === currentDeviceId) {
+        updateUI(metrics);
     }
 });
 
-// History Chart
+socket.on('device-status', (data) => {
+    const { deviceId, online, hostname } = data;
+    if (!devices[deviceId]) devices[deviceId] = {};
+    devices[deviceId].online = online;
+    if (hostname) devices[deviceId].hostname = hostname;
+    updateDeviceSelector();
+    if (deviceId === currentDeviceId) {
+        updateDeviceStatusDot(online);
+    }
+});
+
+socket.on('vnc-status', (data) => {
+    if (!devices[localDeviceId]) devices[localDeviceId] = {};
+    if (!devices[localDeviceId].metrics) devices[localDeviceId].metrics = {};
+    devices[localDeviceId].metrics.vnc = data;
+    if (currentDeviceId === localDeviceId) {
+        updateVncUI(data);
+    }
+});
+
+// ===== History Chart =====
 let historyChartInstance = null;
 const historyCtx = document.getElementById('historyChart').getContext('2d');
 
@@ -353,7 +451,8 @@ async function loadHistory(range) {
         return;
     }
 
-    const res = await fetch(`/api/history?range=${range}`);
+    const deviceId = currentDeviceId || localDeviceId;
+    const res = await fetch(`/api/history?range=${range}&deviceId=${encodeURIComponent(deviceId)}`);
     const data = await res.json();
 
     if (!data || data.length === 0) return;
@@ -406,22 +505,47 @@ document.querySelectorAll('.time-btn').forEach(btn => {
     });
 });
 
-// Initial Load
-loadHistory('1d');
+// ===== Initialization =====
+async function init() {
+    try {
+        const res = await fetch('/api/devices');
+        const list = await res.json();
+        list.forEach(d => {
+            devices[d.deviceId] = {
+                hostname: d.hostname,
+                online: d.online,
+                isLocal: d.isLocal,
+                metrics: null,
+                lastUpdate: Date.now(),
+            };
+            if (d.isLocal) localDeviceId = d.deviceId;
+        });
+        currentDeviceId = localDeviceId;
+        updateDeviceSelector();
+        updateLocalControlsVisibility();
+        loadHistory('1d');
+        if (localDeviceId) fetchVncStatus();
+    } catch (err) {
+        console.error('Init devices failed:', err);
+    }
 
-// Sync fan toggle state
-fetch('/api/fan')
-    .then(res => res.json())
-    .then(data => {
-        fanToggle.checked = data.mode === 'strong';
-    })
-    .catch(() => {
-        fanToggle.checked = false;
-    });
+    // Sync fan toggle state (local only)
+    if (localDeviceId) {
+        fetch('/api/fan')
+            .then(res => res.json())
+            .then(data => {
+                fanToggle.checked = data.mode === 'strong';
+            })
+            .catch(() => {
+                fanToggle.checked = false;
+            });
+    }
+}
 
-vncCheckBtn.addEventListener('click', () => runVncAction('/api/vnc/check', vncCheckBtn));
-vncStartBtn.addEventListener('click', () => runVncAction('/api/vnc/start', vncStartBtn));
-vncWebBtn.addEventListener('click', openWebRemoteDesktop);
+init();
 
-fetchVncStatus();
-setInterval(fetchVncStatus, 15000);
+setInterval(() => {
+    if (currentDeviceId === localDeviceId) {
+        fetchVncStatus();
+    }
+}, 15000);

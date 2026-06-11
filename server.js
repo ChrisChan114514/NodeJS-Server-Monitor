@@ -10,14 +10,19 @@ const fs = require('fs');
 const net = require('net');
 const crypto = require('crypto');
 const { exec } = require('child_process');
+const AedesModule = require('aedes');
+const Aedes = AedesModule.Aedes || AedesModule;
+const { collectMetrics } = require('./lib/metrics');
 
-const PORT = 5020;
-const VNC_PORT = 5901;
-const VNC_CHECK_INTERVAL_MS = 60 * 1000;
-const DB_PATH = path.join(__dirname, 'database', 'metrics.db');
-const LOG_DIR = path.join(__dirname, 'logs');
-const VNC_CHECK_SCRIPT = path.join(__dirname, 'scripts', 'check_vnc_5901.sh');
-const VNC_LOG_FILE = path.join(LOG_DIR, 'check_vnc_5901.log');
+// ==================== Config ====================
+const SERVER_CONFIG_PATH = path.join(__dirname, 'server.config.json');
+let serverConfig = { port: 5020, mqttPort: 1883, localDeviceId: 'local-server', agentToken: '' };
+try {
+    serverConfig = { ...serverConfig, ...JSON.parse(fs.readFileSync(SERVER_CONFIG_PATH, 'utf8')) };
+} catch (err) {
+    console.warn('Warning: server.config.json not found or invalid. Using defaults.');
+}
+
 const EMAIL_CONFIG_PATH = path.join(__dirname, 'email.config.json');
 let emailConfig = {};
 try {
@@ -25,6 +30,18 @@ try {
 } catch (err) {
     console.warn('Warning: email.config.json not found or invalid. Email alerts will be disabled.');
 }
+
+const PORT = serverConfig.port;
+const MQTT_PORT = serverConfig.mqttPort;
+const LOCAL_DEVICE_ID = serverConfig.localDeviceId;
+const AGENT_TOKEN = serverConfig.agentToken || '';
+
+const VNC_PORT = 5901;
+const VNC_CHECK_INTERVAL_MS = 60 * 1000;
+const DB_PATH = path.join(__dirname, 'database', 'metrics.db');
+const LOG_DIR = path.join(__dirname, 'logs');
+const VNC_CHECK_SCRIPT = path.join(__dirname, 'scripts', 'check_vnc_5901.sh');
+const VNC_LOG_FILE = path.join(LOG_DIR, 'check_vnc_5901.log');
 
 const EMAIL_USER = emailConfig.user || '';
 const EMAIL_PASS = emailConfig.pass || '';
@@ -42,6 +59,7 @@ const RAM_THRESHOLD = 95;
 const GPU_THRESHOLD = 90;
 const CONSECUTIVE_ALERTS_REQUIRED = 5;
 
+// ==================== Database ====================
 if (!fs.existsSync(path.dirname(DB_PATH))) {
     fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
 }
@@ -50,48 +68,87 @@ if (!fs.existsSync(LOG_DIR)) {
 }
 
 const db = new Database(DB_PATH);
-db.exec(`
-    CREATE TABLE IF NOT EXISTS metrics (
-        timestamp INTEGER PRIMARY KEY,
-        cpu_load REAL,
-        mem_used INTEGER,
-        mem_total INTEGER,
-        gpu_load REAL,
-        gpu_mem_used INTEGER,
-        gpu_mem_total INTEGER,
-        temp_main REAL,
-        temp_gpu REAL,
-        gpu_name TEXT,
-        disk_read_sec REAL,
-        disk_write_sec REAL,
-        fs_size INTEGER,
-        fs_used INTEGER,
-        net_rx_sec REAL,
-        net_tx_sec REAL
-    )
-`);
 
-try {
+// Migrate old schema (single-device) to multi-device schema
+(function migrateDb() {
+    const tableExists = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='metrics'").get();
+    if (!tableExists) {
+        db.exec(`
+            CREATE TABLE metrics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                device_id TEXT NOT NULL,
+                timestamp INTEGER NOT NULL,
+                cpu_load REAL,
+                mem_used INTEGER,
+                mem_total INTEGER,
+                gpu_load REAL,
+                gpu_mem_used INTEGER,
+                gpu_mem_total INTEGER,
+                temp_main REAL,
+                temp_gpu REAL,
+                gpu_name TEXT,
+                disk_read_sec REAL,
+                disk_write_sec REAL,
+                fs_size INTEGER,
+                fs_used INTEGER,
+                net_rx_sec REAL,
+                net_tx_sec REAL
+            )
+        `);
+        db.exec('CREATE INDEX idx_metrics_device_time ON metrics(device_id, timestamp)');
+        return;
+    }
+
     const columns = db.pragma('table_info(metrics)');
-    if (!columns.some((c) => c.name === 'temp_gpu')) db.exec('ALTER TABLE metrics ADD COLUMN temp_gpu REAL');
-    if (!columns.some((c) => c.name === 'gpu_name')) db.exec('ALTER TABLE metrics ADD COLUMN gpu_name TEXT');
-    if (!columns.some((c) => c.name === 'net_rx_sec')) db.exec('ALTER TABLE metrics ADD COLUMN net_rx_sec REAL');
-    if (!columns.some((c) => c.name === 'net_tx_sec')) db.exec('ALTER TABLE metrics ADD COLUMN net_tx_sec REAL');
-} catch (error) {
-    console.warn('DB migration warning:', error.message);
-}
+    const hasDeviceId = columns.some((c) => c.name === 'device_id');
+    if (hasDeviceId) return;
+
+    console.log('Migrating database to support multi-device...');
+    db.exec('ALTER TABLE metrics RENAME TO metrics_old');
+    db.exec(`
+        CREATE TABLE metrics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            device_id TEXT NOT NULL,
+            timestamp INTEGER NOT NULL,
+            cpu_load REAL,
+            mem_used INTEGER,
+            mem_total INTEGER,
+            gpu_load REAL,
+            gpu_mem_used INTEGER,
+            gpu_mem_total INTEGER,
+            temp_main REAL,
+            temp_gpu REAL,
+            gpu_name TEXT,
+            disk_read_sec REAL,
+            disk_write_sec REAL,
+            fs_size INTEGER,
+            fs_used INTEGER,
+            net_rx_sec REAL,
+            net_tx_sec REAL
+        )
+    `);
+
+    const oldColNames = columns.map((c) => c.name).filter((c) => c !== 'timestamp');
+    const insertCols = ['device_id', 'timestamp', ...oldColNames].join(', ');
+    const selectCols = [`'${LOCAL_DEVICE_ID}' as device_id`, 'timestamp', ...oldColNames].join(', ');
+    db.exec(`INSERT INTO metrics (${insertCols}) SELECT ${selectCols} FROM metrics_old`);
+    db.exec('DROP TABLE metrics_old');
+    db.exec('CREATE INDEX idx_metrics_device_time ON metrics(device_id, timestamp)');
+    console.log('Database migration completed.');
+})();
 
 const insertStmt = db.prepare(`
     INSERT INTO metrics (
-        timestamp, cpu_load, mem_used, mem_total,
+        device_id, timestamp, cpu_load, mem_used, mem_total,
         gpu_load, gpu_mem_used, gpu_mem_total,
         temp_main, temp_gpu, gpu_name,
         disk_read_sec, disk_write_sec,
         fs_size, fs_used,
         net_rx_sec, net_tx_sec
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
+// ==================== Express + Socket.io ====================
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server);
@@ -108,6 +165,93 @@ app.use((req, res, next) => {
     next();
 });
 
+// ==================== MQTT Broker (Aedes) ====================
+const aedes = new Aedes();
+const mqttServer = net.createServer(aedes.handle);
+
+// Agent authentication
+aedes.authenticate = (client, username, password, callback) => {
+    if (!AGENT_TOKEN) {
+        // If no token configured, allow all (for quick local testing)
+        return callback(null, true);
+    }
+    if (username === 'agent' && password && password.toString() === AGENT_TOKEN) {
+        return callback(null, true);
+    }
+    console.warn(`MQTT auth failed for client ${client ? client.id : 'unknown'}`);
+    callback(new Error('Authentication failed'), false);
+};
+
+// Devices registry: deviceId -> { online, hostname, lastSeenAt }
+const devices = new Map();
+
+function setDeviceOnline(deviceId, info) {
+    const existing = devices.get(deviceId) || {};
+    devices.set(deviceId, { ...existing, ...info, online: true, lastSeenAt: Date.now() });
+    io.emit('device-status', { deviceId, online: true, hostname: info.hostname || deviceId });
+}
+
+function storeMetrics(deviceId, metrics) {
+    try {
+        insertStmt.run(
+            deviceId,
+            metrics.timestamp,
+            metrics.cpu_load,
+            metrics.mem_used,
+            metrics.mem_total,
+            metrics.gpu_load,
+            metrics.gpu_mem_used,
+            metrics.gpu_mem_total,
+            metrics.temp_main,
+            metrics.temp_gpu,
+            metrics.gpu_name,
+            metrics.disk_read_sec,
+            metrics.disk_write_sec,
+            metrics.fs_size,
+            metrics.fs_used,
+            metrics.net_rx_sec,
+            metrics.net_tx_sec
+        );
+    } catch (err) {
+        console.error('DB insert error:', err.message);
+    }
+}
+
+aedes.on('publish', (packet, client) => {
+    if (!client) return;
+    const topic = packet.topic;
+    const match = topic.match(/^agents\/([^/]+)\/(metrics|status)$/);
+    if (!match) return;
+
+    const deviceId = match[1];
+    const type = match[2];
+
+    try {
+        const payload = JSON.parse(packet.payload.toString());
+        if (type === 'status') {
+            setDeviceOnline(deviceId, { hostname: payload.hostname || deviceId });
+        } else if (type === 'metrics') {
+            setDeviceOnline(deviceId, { hostname: payload.hostname || deviceId });
+            storeMetrics(deviceId, payload);
+            io.emit('metrics', { deviceId, ...payload, vnc: null });
+        }
+    } catch (err) {
+        console.warn('Invalid agent payload on topic', topic, err.message);
+    }
+});
+
+// Offline detection: if no message from agent for 15s, mark offline
+setInterval(() => {
+    const now = Date.now();
+    for (const [deviceId, info] of devices) {
+        if (info.online && now - info.lastSeenAt > 15000) {
+            info.online = false;
+            io.emit('device-status', { deviceId, online: false, hostname: info.hostname || deviceId });
+        }
+    }
+}, 5000);
+
+// ==================== Email ====================
 const transporter = nodemailer.createTransport({
     host: EMAIL_SMTP_HOST,
     port: EMAIL_SMTP_PORT,
@@ -132,7 +276,6 @@ let vncState = {
     lastReason: 'init',
     lastMessage: 'VNC 未检查',
 };
-const cpuBrandPromise = si.cpu().then((info) => info.brand || info.manufacturer || 'Unknown CPU').catch(() => 'Unknown CPU');
 
 function runCommand(command, timeout = 1500) {
     return new Promise((resolve) => {
@@ -233,113 +376,6 @@ async function runVncWatchdog(reason = 'periodic') {
     return { success: isSuccess, state: getVncStateSnapshot() };
 }
 
-async function getGpuFromNvidiaSmi() {
-    const cmd = 'nvidia-smi --query-gpu=name,temperature.gpu,memory.used,memory.total,utilization.gpu --format=csv,noheader,nounits';
-    const { error, stdout } = await runCommand(cmd, 2000);
-    if (error || !stdout) return null;
-
-    const firstLine = stdout.split('\n')[0].trim();
-    const parts = firstLine.split(',').map((item) => item.trim());
-    if (parts.length < 5) return null;
-
-    return {
-        name: parts[0] || 'NVIDIA GPU',
-        temp: Number.parseFloat(parts[1]) || 0,
-        memUsed: Number.parseInt(parts[2], 10) || 0,
-        memTotal: Number.parseInt(parts[3], 10) || 0,
-        load: Number.parseFloat(parts[4]) || 0,
-        source: 'nvidia-smi',
-    };
-}
-
-async function getGpuFromSystemInformation() {
-    try {
-        const graphics = await si.graphics();
-        if (!graphics.controllers || graphics.controllers.length === 0) return null;
-
-        const controller = graphics.controllers.find((c) => (c.vendor || '').toLowerCase().includes('nvidia')) || graphics.controllers[0];
-        return {
-            name: controller.model || controller.vendor || 'GPU',
-            temp: Number.parseFloat(controller.temperatureGpu) || 0,
-            memUsed: Number.parseInt(controller.memoryUsed || 0, 10),
-            memTotal: Number.parseInt(controller.memoryTotal || 0, 10),
-            load: Number.parseFloat(controller.utilizationGpu) || 0,
-            source: 'systeminformation',
-        };
-    } catch {
-        return null;
-    }
-}
-
-async function getGpuMetrics() {
-    const fromSmi = await getGpuFromNvidiaSmi();
-    if (fromSmi) return fromSmi;
-    const fromSi = await getGpuFromSystemInformation();
-    if (fromSi) return fromSi;
-    return {
-        name: 'GPU Not Available',
-        temp: 0,
-        memUsed: 0,
-        memTotal: 0,
-        load: 0,
-        source: 'none',
-    };
-}
-
-function getNetworkSummary(netStats) {
-    if (!Array.isArray(netStats) || netStats.length === 0) {
-        return { rx: 0, tx: 0 };
-    }
-    const valid = netStats.filter((entry) => (entry.iface || '').toLowerCase() !== 'lo');
-    const target = valid.length > 0 ? valid : netStats;
-    const rx = target.reduce((sum, entry) => sum + (entry.rx_sec || 0), 0);
-    const tx = target.reduce((sum, entry) => sum + (entry.tx_sec || 0), 0);
-    return { rx, tx };
-}
-
-async function collectMetrics() {
-    try {
-        const [cpuLoad, mem, temp, fsSize, diskIO, netStats, gpu, cpuBrand] = await Promise.all([
-            si.currentLoad(),
-            si.mem(),
-            si.cpuTemperature(),
-            si.fsSize(),
-            si.disksIO(),
-            si.networkStats(),
-            getGpuMetrics(),
-            cpuBrandPromise,
-        ]);
-
-        const rootFs = fsSize.find((item) => item.mount === '/') || fsSize[0] || { size: 0, used: 0 };
-        const network = getNetworkSummary(netStats);
-
-        return {
-            timestamp: Date.now(),
-            cpu_name: cpuBrand,
-            cpu_load: Number.parseFloat(cpuLoad.currentLoad || 0),
-            cpu_cores: Array.isArray(cpuLoad.cpus) ? cpuLoad.cpus.map((core) => Number.parseFloat(core.load || 0)) : [],
-            mem_used: Number.parseInt(mem.active || 0, 10),
-            mem_total: Number.parseInt(mem.total || 0, 10),
-            gpu_load: Number.parseFloat(gpu.load || 0),
-            gpu_mem_used: Number.parseInt(gpu.memUsed || 0, 10),
-            gpu_mem_total: Number.parseInt(gpu.memTotal || 0, 10),
-            temp_main: Number.parseFloat(temp.main || 0),
-            temp_gpu: Number.parseFloat(gpu.temp || 0),
-            gpu_name: gpu.name || 'Unknown GPU',
-            gpu_source: gpu.source || 'none',
-            disk_read_sec: Number.parseFloat(diskIO.rIO_sec || 0),
-            disk_write_sec: Number.parseFloat(diskIO.wIO_sec || 0),
-            fs_size: Number.parseInt(rootFs.size || 0, 10),
-            fs_used: Number.parseInt(rootFs.used || 0, 10),
-            net_rx_sec: Number.parseFloat(network.rx || 0),
-            net_tx_sec: Number.parseFloat(network.tx || 0),
-        };
-    } catch (error) {
-        console.error('collectMetrics error:', error.message);
-        return null;
-    }
-}
-
 async function sendAlertEmail(subject, message) {
     const now = Date.now();
     const isManual = subject.includes('Manual Report');
@@ -355,6 +391,8 @@ async function sendAlertEmail(subject, message) {
     await transporter.sendMail(payload);
     if (!isManual) lastEmailTime = now;
 }
+
+// ==================== Routes ====================
 
 app.post('/api/report', async (_req, res) => {
     try {
@@ -428,15 +466,37 @@ app.get('/api/fan', (_req, res) => {
     res.json({ mode: fanMode });
 });
 
+app.get('/api/devices', (_req, res) => {
+    const list = [];
+    // Local device is always present
+    list.push({
+        deviceId: LOCAL_DEVICE_ID,
+        hostname: LOCAL_DEVICE_ID,
+        online: true,
+        isLocal: true,
+    });
+    for (const [deviceId, info] of devices) {
+        if (deviceId === LOCAL_DEVICE_ID) continue;
+        list.push({
+            deviceId,
+            hostname: info.hostname || deviceId,
+            online: !!info.online,
+            isLocal: false,
+        });
+    }
+    res.json(list);
+});
+
 app.get('/api/history', (req, res) => {
     const range = req.query.range || '1d';
+    const deviceId = req.query.deviceId || LOCAL_DEVICE_ID;
     let hours = 24;
     if (range === '7d') hours = 24 * 7;
     if (range === '30d') hours = 24 * 30;
 
     const startTime = Date.now() - hours * 60 * 60 * 1000;
     try {
-        const rows = db.prepare('SELECT * FROM metrics WHERE timestamp > ? ORDER BY timestamp ASC').all(startTime);
+        const rows = db.prepare('SELECT * FROM metrics WHERE device_id = ? AND timestamp > ? ORDER BY timestamp ASC').all(deviceId, startTime);
         let result = rows;
         if (range === '7d') result = rows.filter((_, index) => index % 10 === 0);
         if (range === '30d') result = rows.filter((_, index) => index % 60 === 0);
@@ -521,6 +581,7 @@ app.get('/api/vnc/logs', (req, res) => {
 
 app.use(express.static(path.join(__dirname, 'public')));
 
+// ==================== VNC WebSocket Proxy ====================
 server.on('upgrade', (req, socket, head) => {
     let pathname = '';
     let token = '';
@@ -593,33 +654,18 @@ vncWss.on('connection', (ws) => {
     });
 });
 
+// ==================== Local Metrics Loop ====================
 setInterval(async () => {
     const metrics = await collectMetrics();
     if (!metrics) return;
 
+    storeMetrics(LOCAL_DEVICE_ID, metrics);
+
     io.emit('metrics', {
+        deviceId: LOCAL_DEVICE_ID,
         ...metrics,
         vnc: getVncStateSnapshot(),
     });
-
-    insertStmt.run(
-        metrics.timestamp,
-        metrics.cpu_load,
-        metrics.mem_used,
-        metrics.mem_total,
-        metrics.gpu_load,
-        metrics.gpu_mem_used,
-        metrics.gpu_mem_total,
-        metrics.temp_main,
-        metrics.temp_gpu,
-        metrics.gpu_name,
-        metrics.disk_read_sec,
-        metrics.disk_write_sec,
-        metrics.fs_size,
-        metrics.fs_used,
-        metrics.net_rx_sec,
-        metrics.net_tx_sec
-    );
 
     if (metrics.cpu_load > CPU_THRESHOLD) alertState.cpu += 1; else alertState.cpu = 0;
     const ramPercent = metrics.mem_total > 0 ? (metrics.mem_used / metrics.mem_total) * 100 : 0;
@@ -656,6 +702,26 @@ runVncWatchdog('startup').catch((error) => {
     console.error('VNC watchdog startup error:', error.message);
 });
 
+server.on('error', (err) => {
+    if (err.code === 'EADDRINUSE') {
+        console.error(`Error: HTTP port ${PORT} is already in use.`);
+    } else {
+        console.error('HTTP Server error:', err.message);
+    }
+});
+
+mqttServer.on('error', (err) => {
+    if (err.code === 'EADDRINUSE') {
+        console.error(`Error: MQTT port ${MQTT_PORT} is already in use.`);
+    } else {
+        console.error('MQTT Server error:', err.message);
+    }
+});
+
 server.listen(PORT, () => {
     console.log(`Server running on http://localhost:${PORT}`);
+});
+
+mqttServer.listen(MQTT_PORT, () => {
+    console.log(`MQTT Broker running on mqtt://localhost:${MQTT_PORT}`);
 });

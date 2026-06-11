@@ -13,6 +13,11 @@
         <header>
             <h1>服务器实时监控 <button id="send-report-btn" class="report-btn">发送即时报告</button></h1>
             <div class="header-controls">
+                <div class="device-selector">
+                    <label for="device-select">监控设备:</label>
+                    <select id="device-select"></select>
+                    <span id="device-status-dot" class="status-dot online" title="在线"></span>
+                </div>
                 <div class="fan-control">
                     <span>强力风扇模式:</span>
                     <label class="switch">

@@ -1,0 +1,5 @@
+{
+    "deviceId": "raspberry-pi-4b-office",
+    "brokerUrl": "mqtt://your-public-domain:1883",
+    "token": "change-me-to-a-random-secret-string"
+}
