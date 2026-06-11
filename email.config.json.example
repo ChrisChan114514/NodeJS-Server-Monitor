@@ -1,0 +1,11 @@
+{
+    "user": "your-email@example.com",
+    "pass": "your-password-or-auth-code",
+    "receivers": ["receiver@example.com"],
+    "signatureId": "123456",
+    "smtp": {
+        "host": "smtp.example.com",
+        "port": 465,
+        "secure": true
+    }
+}

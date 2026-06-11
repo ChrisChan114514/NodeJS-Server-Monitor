@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>网页远程桌面</title>
+    <link rel="stylesheet" href="remote.css">
+</head>
+<body>
+    <div class="remote-shell">
+        <header class="top-bar">
+            <div class="title-wrap">
+                <h1>网页远程桌面</h1>
+                <p id="status-text">准备连接...</p>
+            </div>
+            <div class="actions">
+                <button id="fullscreen-btn" class="bar-btn">沉浸全屏</button>
+                <button id="reconnect-btn" class="bar-btn">重连</button>
+                <a class="bar-btn" href="/">返回监控面板</a>
+            </div>
+        </header>
+
+        <main class="viewer-wrap">
+            <div id="vnc-screen" class="vnc-screen" aria-label="Remote desktop viewer"></div>
+            <div id="overlay" class="overlay hidden"></div>
+        </main>
+        <p class="tip-line">连接后将自动尝试全屏，按 <kbd>Esc</kbd> 可退出全屏。</p>
+        <button id="immersive-exit-btn" class="immersive-exit-btn hidden">退出全屏</button>
+    </div>
+
+    <script type="module" src="remote.js"></script>
+</body>
+</html>

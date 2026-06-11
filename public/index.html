@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>服务器监控面板</title>
+    <link rel="stylesheet" href="style.css">
+    <script src="/vendor/chart.js/chart.umd.js"></script>
+    <script src="/socket.io/socket.io.js"></script>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>服务器实时监控 <button id="send-report-btn" class="report-btn">发送即时报告</button></h1>
+            <div class="header-controls">
+                <div class="fan-control">
+                    <span>强力风扇模式:</span>
+                    <label class="switch">
+                        <input type="checkbox" id="fan-toggle">
+                        <span class="slider round"></span>
+                    </label>
+                </div>
+                <div id="status" class="status-badge connecting">连接中...</div>
+            </div>
+        </header>
+
+        <div class="dashboard-grid">
+            <!-- CPU Card -->
+            <div class="card clickable" id="cpu-card">
+                <div class="card-header">
+                    <h2>CPU</h2>
+                    <span id="cpu-value" class="metric-value">0%</span>
+                </div>
+                <div class="model-line" id="cpu-name-line">--</div>
+                <div class="chart-container">
+                    <canvas id="cpuChart"></canvas>
+                </div>
+                <div class="mini-stat">
+                    <span>Temp: <span id="temp-value">--</span>°C</span>
+                    <span>点击查看多核</span>
+                </div>
+            </div>
+
+            <!-- RAM Card -->
+            <div class="card">
+                <div class="card-header">
+                    <h2>内存 (RAM)</h2>
+                    <span id="ram-value" class="metric-value">0%</span>
+                </div>
+                <div class="chart-container">
+                    <canvas id="ramChart"></canvas>
+                </div>
+                <div class="mini-stat">
+                    <span id="ram-detail">0 GB / 0 GB</span>
+                </div>
+            </div>
+
+            <!-- GPU Card -->
+            <div class="card">
+                <div class="card-header">
+                    <h2>GPU</h2>
+                    <span id="gpu-value" class="metric-value">0%</span>
+                </div>
+                <div class="model-line" id="gpu-name">--</div>
+                <div class="chart-container">
+                    <canvas id="gpuChart"></canvas>
+                </div>
+                <div class="mini-stat">
+                    <span>Mem: <span id="gpu-mem-value">0%</span></span>
+                    <span>Temp: <span id="gpu-temp-value">--</span>°C</span>
+                </div>
+            </div>
+
+            <!-- Network Card -->
+            <div class="card">
+                <div class="card-header">
+                    <h2>网络传输</h2>
+                    <span id="net-total" class="metric-value">0 KB/s</span>
+                </div>
+                <div class="chart-container">
+                    <canvas id="netChart"></canvas>
+                </div>
+                <div class="mini-stat">
+                    <span>入站: <span id="net-in">0 KB/s</span></span>
+                    <span>出站: <span id="net-out">0 KB/s</span></span>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <h2>温度总览</h2>
+                    <span id="temp-state" class="metric-value">正常</span>
+                </div>
+                <div class="chart-container">
+                    <canvas id="tempChart"></canvas>
+                </div>
+                <div class="mini-stat">
+                    <span>CPU: <span id="temp-cpu-value">--</span>°C</span>
+                    <span>GPU: <span id="temp-gpu-value">--</span>°C</span>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <h2>磁盘空间</h2>
+                    <span id="disk-usage-value" class="metric-value">0%</span>
+                </div>
+                <div class="chart-container">
+                    <canvas id="diskChart"></canvas>
+                </div>
+                <div class="progress-bar-container">
+                    <div id="disk-progress" class="progress-bar" style="width: 0%"></div>
+                </div>
+                <div class="mini-stat">
+                    <span id="disk-detail">0 GB / 0 GB</span>
+                    <span>挂载: /</span>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <h2>磁盘 I/O</h2>
+                    <span id="disk-io-total" class="metric-value">0 MB/s</span>
+                </div>
+                <div class="chart-container">
+                    <canvas id="diskIoChart"></canvas>
+                </div>
+                <div class="mini-stat">
+                    <span>Read: <span id="disk-read">0 MB/s</span></span>
+                    <span>Write: <span id="disk-write">0 MB/s</span></span>
+                </div>
+            </div>
+
+            <div class="card vnc-card">
+                <div class="card-header">
+                    <h2>VNC 5901</h2>
+                    <span id="vnc-state" class="metric-value">未知</span>
+                </div>
+                <div class="model-line" id="vnc-last-check">最近检查: --</div>
+                <div class="mini-stat">
+                    <span>端口</span>
+                    <span id="vnc-port">5901</span>
+                </div>
+                <div class="vnc-actions">
+                    <button id="vnc-check-btn" class="report-btn">立即检查</button>
+                    <button id="vnc-start-btn" class="report-btn">一键启动</button>
+                    <button id="vnc-web-btn" class="report-btn">远程桌面连接</button>
+                </div>
+                <pre id="vnc-log-preview" class="vnc-log-preview">暂无日志</pre>
+            </div>
+        </div>
+
+        <!-- History Section -->
+        <section class="history-section">
+            <div class="history-header">
+                <h2>历史趋势</h2>
+                <div class="time-controls">
+                    <button class="time-btn active" data-range="1d">24小时</button>
+                    <button class="time-btn" data-range="7d">7天</button>
+                    <button class="time-btn" data-range="30d">30天</button>
+                </div>
+            </div>
+            <div class="history-chart-container">
+                <canvas id="historyChart"></canvas>
+            </div>
+        </section>
+
+        <div id="cpu-modal" class="modal hidden">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h3>CPU 多核占用</h3>
+                    <button id="cpu-modal-close" class="modal-close">×</button>
+                </div>
+                <div id="cpu-core-list" class="core-list"></div>
+            </div>
+        </div>
+    </div>
+    <script src="client.js"></script>
+</body>
+</html>
