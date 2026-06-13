@@ -15,7 +15,26 @@ try {
     process.exit(1);
 }
 
-const deviceId = config.deviceId || os.hostname();
+// Enforce unique deviceId across all agents.
+// Multiple agents with the same deviceId (e.g. "local") would collide on the
+// MQTT broker (same clientId) and overwrite each other in the server's device
+// registry, causing the frontend to flicker between different hosts.
+const GENERIC_DEVICE_IDS = new Set(['local', 'localhost', 'default', 'agent', 'test', '']);
+function isGenericDeviceId(id) {
+    return GENERIC_DEVICE_IDS.has((id || '').trim().toLowerCase());
+}
+let deviceId = config.deviceId || os.hostname();
+if (isGenericDeviceId(deviceId)) {
+    const hostname = os.hostname();
+    if (hostname && hostname !== deviceId) {
+        console.warn(`[Agent] WARNING: deviceId in config ("${deviceId}") is not unique. Auto-overriding with hostname: "${hostname}".`);
+        console.warn('[Agent] Please update agent.config.json and set "deviceId" to a unique value (e.g. the hostname).');
+        deviceId = hostname;
+    } else if (!hostname) {
+        console.error('[Agent] ERROR: Could not determine a unique deviceId. Please set "deviceId" in agent.config.json to a unique value.');
+        process.exit(1);
+    }
+}
 const deviceName = config.deviceName || deviceId;
 const brokerUrl = config.brokerUrl || 'mqtt://localhost:1883';
 const token = config.token || '';
@@ -35,6 +54,7 @@ function getStatusPayload(online) {
 }
 
 const client = mqtt.connect(brokerUrl, {
+    clientId: deviceId,
     username: 'agent',
     password: token,
     reconnectPeriod: 5000,

@@ -227,8 +227,20 @@ aedes.on('publish', (packet, client) => {
     const match = topic.match(/^agents\/([^/]+)\/(metrics|status)$/);
     if (!match) return;
 
-    const deviceId = match[1];
+    // Use the MQTT client.id as the authoritative device identifier.
+    // The MQTT broker guarantees unique client IDs per connection, so this
+    // prevents multiple agents from overwriting each other when they share
+    // the same deviceId in their config (e.g. "local").
+    const deviceId = client.id;
+    const topicDeviceId = match[1];
     const type = match[2];
+
+    // Warn if the topic's deviceId doesn't match the client's ID — this
+    // indicates a misconfigured agent (or an old agent that still uses a
+    // generic deviceId like "local").
+    if (topicDeviceId !== deviceId) {
+        console.warn(`[MQTT] Topic deviceId "${topicDeviceId}" does not match client.id "${deviceId}". Using client.id as authoritative.`);
+    }
 
     try {
         const payload = JSON.parse(packet.payload.toString());
@@ -239,7 +251,7 @@ aedes.on('publish', (packet, client) => {
             const isLocal = payload.isLocal === true;
             setDeviceOnline(deviceId, { hostname: payload.hostname || deviceId, isLocal });
             storeMetrics(deviceId, payload);
-            io.emit('metrics', { deviceId, ...payload, vnc: null });
+            io.emit('metrics', { ...payload, vnc: null, deviceId });
             if (isLocal) {
                 checkLocalAlerts(payload);
             }

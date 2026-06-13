@@ -1,4 +1,5 @@
 {
+    "_comment": "deviceId 必须每台设备唯一！不要使用 'local'、'localhost' 等通用值。推荐使用主机名或自定义唯一名称。",
     "deviceId": "raspberry-pi-4b-office",
     "brokerUrl": "mqtt://your-public-domain:1883",
     "token": "change-me-to-a-random-secret-string"
