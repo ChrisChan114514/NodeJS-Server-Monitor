@@ -154,7 +154,8 @@ function updateDeviceSelector() {
         const info = devices[id];
         const opt = document.createElement('option');
         opt.value = id;
-        opt.textContent = `${info.hostname || id}${info.isLocal ? ' (本机)' : ''}`;
+        const displayName = info.deviceName || info.hostname || id;
+        opt.textContent = `${displayName}${info.isLocal ? ' (本机)' : ''}`;
         deviceSelect.appendChild(opt);
     });
     if (prevVal && devices[prevVal]) {
@@ -175,7 +176,8 @@ function updateDeviceStatusDot(online) {
 }
 
 function updateLocalControlsVisibility() {
-    const isLocal = currentDeviceId === localDeviceId;
+    const dev = devices[currentDeviceId];
+    const isLocal = !!(dev && dev.isLocal);
     const display = isLocal ? '' : 'none';
     if (reportBtn) reportBtn.style.display = display;
     const fanControl = fanToggle ? fanToggle.closest('.fan-control') : null;
@@ -422,13 +424,16 @@ socket.on('metrics', (data) => {
 });
 
 socket.on('device-status', (data) => {
-    const { deviceId, online, hostname } = data;
+    const { deviceId, online, hostname, deviceName, isLocal } = data;
     if (!devices[deviceId]) devices[deviceId] = {};
     devices[deviceId].online = online;
     if (hostname) devices[deviceId].hostname = hostname;
+    if (deviceName) devices[deviceId].deviceName = deviceName;
+    if (typeof isLocal === 'boolean') devices[deviceId].isLocal = isLocal;
     updateDeviceSelector();
     if (deviceId === currentDeviceId) {
         updateDeviceStatusDot(online);
+        updateLocalControlsVisibility();
     }
 });
 
@@ -513,6 +518,7 @@ async function init() {
         list.forEach(d => {
             devices[d.deviceId] = {
                 hostname: d.hostname,
+                deviceName: d.deviceName,
                 online: d.online,
                 isLocal: d.isLocal,
                 metrics: null,
@@ -520,11 +526,17 @@ async function init() {
             };
             if (d.isLocal) localDeviceId = d.deviceId;
         });
-        currentDeviceId = localDeviceId;
+        // Default to local device if online, otherwise first available device
+        if (localDeviceId && devices[localDeviceId]) {
+            currentDeviceId = localDeviceId;
+        } else {
+            const first = list[0];
+            currentDeviceId = first ? first.deviceId : null;
+        }
         updateDeviceSelector();
         updateLocalControlsVisibility();
         loadHistory('1d');
-        if (localDeviceId) fetchVncStatus();
+        fetchVncStatus();
     } catch (err) {
         console.error('Init devices failed:', err);
     }
@@ -545,7 +557,8 @@ async function init() {
 init();
 
 setInterval(() => {
-    if (currentDeviceId === localDeviceId) {
+    const dev = devices[currentDeviceId];
+    if (dev && dev.isLocal) {
         fetchVncStatus();
     }
 }, 15000);

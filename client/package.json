@@ -1,0 +1,13 @@
+{
+  "name": "system-monitor-agent",
+  "version": "1.0.0",
+  "description": "System monitoring agent (MQTT client)",
+  "main": "agent.js",
+  "scripts": {
+    "start": "node agent.js"
+  },
+  "dependencies": {
+    "mqtt": "^5.10.4",
+    "systeminformation": "^5.21.22"
+  }
+}

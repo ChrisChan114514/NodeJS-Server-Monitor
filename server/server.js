@@ -2,7 +2,6 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const { WebSocketServer, WebSocket } = require('ws');
-const si = require('systeminformation');
 const nodemailer = require('nodemailer');
 const Database = require('better-sqlite3');
 const path = require('path');
@@ -12,7 +11,6 @@ const crypto = require('crypto');
 const { exec } = require('child_process');
 const AedesModule = require('aedes');
 const Aedes = AedesModule.Aedes || AedesModule;
-const { collectMetrics } = require('./lib/metrics');
 
 // ==================== Config ====================
 const SERVER_CONFIG_PATH = path.join(__dirname, 'server.config.json');
@@ -33,7 +31,8 @@ try {
 
 const PORT = serverConfig.port;
 const MQTT_PORT = serverConfig.mqttPort;
-const LOCAL_DEVICE_ID = serverConfig.localDeviceId;
+// Device registry no longer hard-codes a localDeviceId;
+// 'isLocal' is reported by the agent itself and verified by connection origin.
 const AGENT_TOKEN = serverConfig.agentToken || '';
 
 const VNC_PORT = 5901;
@@ -130,7 +129,7 @@ const db = new Database(DB_PATH);
 
     const oldColNames = columns.map((c) => c.name).filter((c) => c !== 'timestamp');
     const insertCols = ['device_id', 'timestamp', ...oldColNames].join(', ');
-    const selectCols = [`'${LOCAL_DEVICE_ID}' as device_id`, 'timestamp', ...oldColNames].join(', ');
+    const selectCols = ["'local' as device_id", 'timestamp', ...oldColNames].join(', ');
     db.exec(`INSERT INTO metrics (${insertCols}) SELECT ${selectCols} FROM metrics_old`);
     db.exec('DROP TABLE metrics_old');
     db.exec('CREATE INDEX idx_metrics_device_time ON metrics(device_id, timestamp)');
@@ -187,8 +186,13 @@ const devices = new Map();
 
 function setDeviceOnline(deviceId, info) {
     const existing = devices.get(deviceId) || {};
-    devices.set(deviceId, { ...existing, ...info, online: true, lastSeenAt: Date.now() });
-    io.emit('device-status', { deviceId, online: true, hostname: info.hostname || deviceId });
+    // Protect isLocal: once true, stays true; protect hostname/deviceName from being cleared
+    const isLocal = info.isLocal === true || existing.isLocal === true;
+    const hostname = info.hostname || existing.hostname || deviceId;
+    const deviceName = info.deviceName || existing.deviceName || deviceId;
+    const record = { ...existing, ...info, hostname, deviceName, isLocal, online: true, lastSeenAt: Date.now() };
+    devices.set(deviceId, record);
+    io.emit('device-status', { deviceId, online: true, hostname, deviceName, isLocal });
 }
 
 function storeMetrics(deviceId, metrics) {
@@ -229,11 +233,16 @@ aedes.on('publish', (packet, client) => {
     try {
         const payload = JSON.parse(packet.payload.toString());
         if (type === 'status') {
-            setDeviceOnline(deviceId, { hostname: payload.hostname || deviceId });
+            const isLocal = payload.isLocal === true;
+            setDeviceOnline(deviceId, { hostname: payload.hostname || deviceId, deviceName: payload.deviceName || deviceId, isLocal });
         } else if (type === 'metrics') {
-            setDeviceOnline(deviceId, { hostname: payload.hostname || deviceId });
+            const isLocal = payload.isLocal === true;
+            setDeviceOnline(deviceId, { hostname: payload.hostname || deviceId, isLocal });
             storeMetrics(deviceId, payload);
             io.emit('metrics', { deviceId, ...payload, vnc: null });
+            if (isLocal) {
+                checkLocalAlerts(payload);
+            }
         }
     } catch (err) {
         console.warn('Invalid agent payload on topic', topic, err.message);
@@ -392,12 +401,40 @@ async function sendAlertEmail(subject, message) {
     if (!isManual) lastEmailTime = now;
 }
 
+function checkLocalAlerts(metrics) {
+    if (metrics.cpu_load > CPU_THRESHOLD) alertState.cpu += 1; else alertState.cpu = 0;
+    const ramPercent = metrics.mem_total > 0 ? (metrics.mem_used / metrics.mem_total) * 100 : 0;
+    if (ramPercent > RAM_THRESHOLD) alertState.ram += 1; else alertState.ram = 0;
+    if (metrics.gpu_load > GPU_THRESHOLD) alertState.gpu += 1; else alertState.gpu = 0;
+    if (metrics.temp_main > TEMP_THRESHOLD || metrics.temp_gpu > TEMP_THRESHOLD) alertState.temp += 1; else alertState.temp = 0;
+
+    const alerts = [];
+    if (alertState.cpu >= CONSECUTIVE_ALERTS_REQUIRED) alerts.push(`CPU 长时间高负载: ${metrics.cpu_load.toFixed(1)}%`);
+    if (alertState.ram >= CONSECUTIVE_ALERTS_REQUIRED) alerts.push(`RAM 长时间高占用: ${ramPercent.toFixed(1)}%`);
+    if (alertState.gpu >= CONSECUTIVE_ALERTS_REQUIRED) alerts.push(`GPU 长时间高负载: ${metrics.gpu_load.toFixed(1)}%`);
+    if (alertState.temp >= 2) alerts.push(`温度过高 CPU ${metrics.temp_main.toFixed(1)}°C / GPU ${metrics.temp_gpu.toFixed(1)}°C`);
+
+    if (alerts.length > 0) {
+        sendAlertEmail('System Anomaly Detected', alerts.join('\n')).catch((error) => {
+            console.error('auto alert email error:', error.message);
+        });
+    }
+}
+
 // ==================== Routes ====================
+
+function getLocalDeviceId() {
+    for (const [deviceId, info] of devices) {
+        if (info.isLocal) return deviceId;
+    }
+    return 'local';
+}
 
 app.post('/api/report', async (_req, res) => {
     try {
-        const metrics = await collectMetrics();
-        if (!metrics) return res.status(500).json({ success: false, error: '采集系统信息失败' });
+        const localDeviceId = getLocalDeviceId();
+        const metrics = db.prepare('SELECT * FROM metrics WHERE device_id = ? ORDER BY timestamp DESC LIMIT 1').get(localDeviceId);
+        if (!metrics) return res.status(500).json({ success: false, error: '暂无本机监控数据，请确保本机 Agent 已启动' });
 
         const memPercent = metrics.mem_total > 0 ? (metrics.mem_used / metrics.mem_total) * 100 : 0;
         const diskPercent = metrics.fs_size > 0 ? (metrics.fs_used / metrics.fs_size) * 100 : 0;
@@ -405,10 +442,10 @@ app.post('/api/report', async (_req, res) => {
 System Status Report
 --------------------
 Time: ${new Date().toLocaleString()}
+Data Time: ${new Date(metrics.timestamp).toLocaleString()}
 
 - CPU: ${metrics.cpu_load.toFixed(1)}%
 - CPU Model: ${metrics.cpu_name}
-- CPU: ${metrics.cpu_load.toFixed(1)}%
 - CPU Temp: ${metrics.temp_main.toFixed(1)}°C
 - RAM: ${memPercent.toFixed(1)}%
 - GPU: ${metrics.gpu_load.toFixed(1)}%
@@ -468,20 +505,13 @@ app.get('/api/fan', (_req, res) => {
 
 app.get('/api/devices', (_req, res) => {
     const list = [];
-    // Local device is always present
-    list.push({
-        deviceId: LOCAL_DEVICE_ID,
-        hostname: LOCAL_DEVICE_ID,
-        online: true,
-        isLocal: true,
-    });
     for (const [deviceId, info] of devices) {
-        if (deviceId === LOCAL_DEVICE_ID) continue;
         list.push({
             deviceId,
             hostname: info.hostname || deviceId,
+            deviceName: info.deviceName || deviceId,
             online: !!info.online,
-            isLocal: false,
+            isLocal: !!info.isLocal,
         });
     }
     res.json(list);
@@ -489,7 +519,7 @@ app.get('/api/devices', (_req, res) => {
 
 app.get('/api/history', (req, res) => {
     const range = req.query.range || '1d';
-    const deviceId = req.query.deviceId || LOCAL_DEVICE_ID;
+    const deviceId = req.query.deviceId || getLocalDeviceId();
     let hours = 24;
     if (range === '7d') hours = 24 * 7;
     if (range === '30d') hours = 24 * 30;
@@ -653,40 +683,6 @@ vncWss.on('connection', (ws) => {
         }
     });
 });
-
-// ==================== Local Metrics Loop ====================
-setInterval(async () => {
-    const metrics = await collectMetrics();
-    if (!metrics) return;
-
-    storeMetrics(LOCAL_DEVICE_ID, metrics);
-
-    io.emit('metrics', {
-        deviceId: LOCAL_DEVICE_ID,
-        ...metrics,
-        vnc: getVncStateSnapshot(),
-    });
-
-    if (metrics.cpu_load > CPU_THRESHOLD) alertState.cpu += 1; else alertState.cpu = 0;
-    const ramPercent = metrics.mem_total > 0 ? (metrics.mem_used / metrics.mem_total) * 100 : 0;
-    if (ramPercent > RAM_THRESHOLD) alertState.ram += 1; else alertState.ram = 0;
-    if (metrics.gpu_load > GPU_THRESHOLD) alertState.gpu += 1; else alertState.gpu = 0;
-    if (metrics.temp_main > TEMP_THRESHOLD || metrics.temp_gpu > TEMP_THRESHOLD) alertState.temp += 1; else alertState.temp = 0;
-
-    const alerts = [];
-    if (alertState.cpu >= CONSECUTIVE_ALERTS_REQUIRED) alerts.push(`CPU 长时间高负载: ${metrics.cpu_load.toFixed(1)}%`);
-    if (alertState.ram >= CONSECUTIVE_ALERTS_REQUIRED) alerts.push(`RAM 长时间高占用: ${ramPercent.toFixed(1)}%`);
-    if (alertState.gpu >= CONSECUTIVE_ALERTS_REQUIRED) alerts.push(`GPU 长时间高负载: ${metrics.gpu_load.toFixed(1)}%`);
-    if (alertState.temp >= 2) alerts.push(`温度过高 CPU ${metrics.temp_main.toFixed(1)}°C / GPU ${metrics.temp_gpu.toFixed(1)}°C`);
-
-    if (alerts.length > 0) {
-        try {
-            await sendAlertEmail('System Anomaly Detected', alerts.join('\n'));
-        } catch (error) {
-            console.error('auto alert email error:', error.message);
-        }
-    }
-}, 2000);
 
 setInterval(() => {
     runVncWatchdog('periodic').catch((error) => {

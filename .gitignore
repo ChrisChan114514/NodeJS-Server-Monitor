@@ -1,7 +1,7 @@
-# 敏感配置文件
-email.config.json
-server.config.json
-agent.config.json
+# 敏感配置文件（任意层级）
+**/server.config.json
+**/agent.config.json
+**/email.config.json
 IMAP_SMTP.txt
 aliyun_nginx.conf
 .env
@@ -9,15 +9,15 @@ aliyun_nginx.conf
 .env.*.local
 
 # 运行时生成的数据与日志
-database/
-logs/
+**/database/
+**/logs/
 *.log
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
 # 公用程序依赖
-node_modules/
+**/node_modules/
 
 # 操作系统文件
 .DS_Store

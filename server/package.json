@@ -1,24 +1,18 @@
 {
-  "name": "system-monitor",
+  "name": "system-monitor-server",
   "version": "1.0.0",
-  "description": "System monitoring dashboard",
+  "description": "System monitoring dashboard server with MQTT broker",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "@novnc/novnc": "^1.6.0",
     "aedes": "^0.51.3",
     "better-sqlite3": "^11.5.0",
     "chart.js": "^4.4.7",
     "express": "^4.18.2",
-    "mqtt": "^5.15.1",
     "nodemailer": "^6.9.7",
     "socket.io": "^4.7.2",
-    "systeminformation": "^5.21.22",
     "ws": "^8.18.0"
-  },
-  "devDependencies": {
-    "esbuild": "^0.27.3"
   }
 }

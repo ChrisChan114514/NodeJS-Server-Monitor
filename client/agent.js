@@ -16,11 +16,23 @@ try {
 }
 
 const deviceId = config.deviceId || os.hostname();
+const deviceName = config.deviceName || deviceId;
 const brokerUrl = config.brokerUrl || 'mqtt://localhost:1883';
 const token = config.token || '';
+const isLocal = /localhost|127\.0\.0\.1|::1/.test(brokerUrl);
 
 const statusTopic = `agents/${deviceId}/status`;
 const metricsTopic = `agents/${deviceId}/metrics`;
+
+function getStatusPayload(online) {
+    return JSON.stringify({
+        online,
+        hostname: os.hostname(),
+        deviceName,
+        isLocal,
+        timestamp: Date.now(),
+    });
+}
 
 const client = mqtt.connect(brokerUrl, {
     username: 'agent',
@@ -29,7 +41,7 @@ const client = mqtt.connect(brokerUrl, {
     connectTimeout: 30 * 1000,
     will: {
         topic: statusTopic,
-        payload: JSON.stringify({ online: false, hostname: os.hostname() }),
+        payload: getStatusPayload(false),
         qos: 1,
         retain: true,
     },
@@ -37,11 +49,7 @@ const client = mqtt.connect(brokerUrl, {
 
 client.on('connect', () => {
     console.log(`[Agent] Connected to MQTT Broker: ${brokerUrl}`);
-    client.publish(
-        statusTopic,
-        JSON.stringify({ online: true, hostname: os.hostname(), timestamp: Date.now() }),
-        { qos: 1, retain: true }
-    );
+    client.publish(statusTopic, getStatusPayload(true), { qos: 1, retain: true });
 });
 
 client.on('reconnect', () => {
@@ -59,11 +67,7 @@ client.on('error', (err) => {
 // Heartbeat every 5s
 setInterval(() => {
     if (!client.connected) return;
-    client.publish(
-        statusTopic,
-        JSON.stringify({ online: true, hostname: os.hostname(), timestamp: Date.now() }),
-        { qos: 0, retain: true }
-    );
+    client.publish(statusTopic, getStatusPayload(true), { qos: 0, retain: true });
 }, 5000);
 
 // Metrics every 2s
@@ -79,19 +83,14 @@ setInterval(async () => {
     }
 }, 2000);
 
-console.log(`[Agent] Starting with deviceId=${deviceId}, broker=${brokerUrl}`);
+console.log(`[Agent] Starting with deviceId=${deviceId}, deviceName=${deviceName}, isLocal=${isLocal}, broker=${brokerUrl}`);
 
 // Graceful shutdown
 process.on('SIGINT', () => {
     console.log('\n[Agent] Shutting down...');
-    client.publish(
-        statusTopic,
-        JSON.stringify({ online: false, hostname: os.hostname() }),
-        { qos: 1, retain: true },
-        () => {
-            client.end(true, () => {
-                process.exit(0);
-            });
-        }
-    );
+    client.publish(statusTopic, getStatusPayload(false), { qos: 1, retain: true }, () => {
+        client.end(true, () => {
+            process.exit(0);
+        });
+    });
 });
